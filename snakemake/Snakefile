@@ -11,6 +11,11 @@ shell.executable("/bin/bash")
 
 RESULTS = Path(config["results_directory"], "results")
 
+# ggcaller_cluster gets its own resource block so its walltime/memory can be
+# capped independently of the shared batch settings (panaroo_cluster still uses
+# resources_batch). Falls back to resources_batch for configs that predate it.
+GGCALLER_RESOURCES = config.get("resources_ggcaller", config["resources_batch"])
+
 
 # LOGGING
 
@@ -252,12 +257,12 @@ rule ggcaller_cluster:
         done=RESULTS / "ggcaller" / "{cluster}" / "done.txt",
     conda:
         "envs/ggcaller.yaml"
-    threads: config["resources_batch"]["threads"]
+    threads: GGCALLER_RESOURCES["threads"]
     resources:
-        mem=config["resources_batch"]["mem"],
-        runtime=config["resources_batch"]["runtime"],
-        nodes=config["resources_batch"]["nodes"],
-        slurm_partition=config["resources_batch"]["slurm_partition"],
+        mem=GGCALLER_RESOURCES["mem"],
+        runtime=GGCALLER_RESOURCES["runtime"],
+        nodes=GGCALLER_RESOURCES["nodes"],
+        slurm_partition=GGCALLER_RESOURCES["slurm_partition"],
     log:
         str(LOGDIR / "ggcaller_cluster" / "{cluster}.log"),
     shell:
@@ -319,6 +324,9 @@ rule panaroo_cluster:
         done=RESULTS / "panaroo" / "{cluster}" / "done.txt",
     params:
         indir=str(RESULTS),
+        # optional patched-panaroo tree, prepended to PYTHONPATH so it shadows the
+        # conda-installed package without modifying the shared env. Unset = stock.
+        panaroo_override=config.get("panaroo_override", ""),
     conda:
         "envs/panaroo.yaml"
     threads: config["resources_batch"]["threads"]
@@ -339,6 +347,13 @@ rule panaroo_cluster:
         echo "[panaroo_cluster] indir: {params.indir}"
         echo "[panaroo_cluster] outdir: {output.outdir}"
         echo "[panaroo_cluster] threads: {threads}"
+
+        OVERRIDE="{params.panaroo_override}"
+        if [ -n "$OVERRIDE" ]; then
+            export PYTHONPATH="$OVERRIDE${{PYTHONPATH:+:$PYTHONPATH}}"
+            echo "[panaroo_cluster] panaroo override: $OVERRIDE"
+        fi
+        python3 -c "import panaroo,inspect,panaroo.merge_nodes as m; print('[panaroo_cluster] panaroo module:', panaroo.__file__); print('[panaroo_cluster] keyerror patch:', 'YES' if 'PATCH: dedup on the centroid ID' in inspect.getsource(m) else 'NO')"
 
         mkdir -p {output.outdir}
         gffs=$(ls -1 {params.indir}/ggcaller/{wildcards.cluster}/GFF/*.fa.gff)
