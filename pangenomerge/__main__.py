@@ -24,7 +24,8 @@ import shutil
 import glob as glob_module
 
 # import custom functions
-from pangenomerge.custom_functions.manipulate_seqids import indSID_to_allSID, get_seqIDs_in_nodes, dict_to_2d_array, reference_corrected_scores
+from pangenomerge.custom_functions.manipulate_seqids import indSID_to_allSID, get_seqIDs_in_nodes, dict_to_2d_array
+from pangenomerge.custom_functions.graph_similarity import graph_similarity_scores
 from pangenomerge.custom_functions.run_mmseqs import run_mmseqs_search, mmseqs_createdb, mmseqs_concatdbs
 from pangenomerge.panaroo_functions.load_graphs import load_graphs
 from pangenomerge.panaroo_functions.write_gml_metadata import format_metadata_for_gml
@@ -806,9 +807,10 @@ def main():
             logging.debug(f"seqIDs only in merged (excluded): {only_in_graph_1}")
             logging.debug(f"seqIDs only in all (excluded): {only_in_graph_2}")
 
-            # standard scores (per-gene random baseline) AND reference-corrected scores
-            # (component-graph clustering as baseline), computed on the same aligned seqIDs
-            scores = reference_corrected_scores(
+            # standard scores (per-gene random baseline), post-clustering scores
+            # (component graphs as baseline) and attainability-corrected scores (best
+            # merge reachable from those graphs as ceiling), on the same aligned seqIDs
+            scores = graph_similarity_scores(
                 truth_map=cluster_dict_all,
                 merged_map=cluster_dict_merged,
                 component_map=component_cluster_of_seqid,
@@ -819,11 +821,38 @@ def main():
             logging.info(f"Mutual Information: {scores['MI']}")
             logging.info(f"Adjusted Mutual Information: {scores['AMI']}")
 
-            logging.info("Reference-corrected scores (component graphs as baseline):")
+            logging.info("Post-clustering scores (component graphs as baseline):")
             logging.info(f"  RI(merged,all)={scores['RI']:.6f}  RI(component,all)={scores['RI_component']:.6f}")
-            logging.info(f"  Reference-corrected ARI*: {scores['ARI_star']}")
+            logging.info(f"  pcARI: {scores['pcARI']}")
             logging.info(f"  NMI(merged,all)={scores['NMI_merged']:.6f}  NMI(component,all)={scores['NMI_component']:.6f}")
-            logging.info(f"  Reference-corrected AMI*: {scores['AMI_star']}")
+            logging.info(f"  pcNMI: {scores['pcNMI']}")
+
+            if "acARI" in scores:
+                logging.info("Attainability-corrected scores (best reachable merge as ceiling):")
+                logging.info(f"  acARI: {scores['acARI']}")
+                logging.info(f"  acNMI: {scores['acNMI']}")
+                logging.info(f"  pairwise errors: component={scores['err_component']:.0f}  "
+                             f"merged={scores['err_merged']:.0f}  reachable floor={scores['err_cstar']:.0f}")
+
+            logging.info("Over- vs under-merging (all-data graph as reference labels):")
+            logging.info(f"  homogeneity={scores['homogeneity']:.6f}  "
+                         f"(component={scores['homogeneity_component']:.6f})  low => over-merging")
+            logging.info(f"  completeness={scores['completeness']:.6f}  "
+                         f"(component={scores['completeness_component']:.6f})  low => under-merging")
+            logging.info(f"  V-measure={scores['v_measure']:.6f}  "
+                         f"(component={scores['v_measure_component']:.6f})")
+
+            # machine-readable copy of the same numbers, so a results table does not
+            # have to be parsed back out of the log
+            metrics_row = dict(scores)
+            metrics_row["shared_seqIDs"] = len(common_seq_ids)
+            metrics_row["only_in_merged"] = len(only_in_graph_1)
+            metrics_row["only_in_all"] = len(only_in_graph_2)
+            metrics_path = Path(options.outdir) / "test_metrics.tsv"
+            with open(metrics_path, "w") as metrics_handle:
+                metrics_handle.write("\t".join(metrics_row.keys()) + "\n")
+                metrics_handle.write("\t".join(str(v) for v in metrics_row.values()) + "\n")
+            logging.info(f"Wrote test metrics to {metrics_path}")
 
         # info statement...
         logging.info("Merge complete. Preparing attribute metadata for export...")
