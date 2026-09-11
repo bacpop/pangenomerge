@@ -1175,7 +1175,10 @@ def reverse_translate_sequences(protein_sequence_files, dna_sequence_files,
 
     trans_table = get_trans_table(11)
 
-    realigned = Parallel(n_jobs=threads, prefer="threads")(
+    # _codon_align_one_gene is CPU-bound pure Python (Biopython/numpy): with
+    # prefer="threads" the GIL serialised 48 workers onto ~1 core. All arguments
+    # (paths, bools, [ndarray, set]) pickle, so a process pool is safe.
+    realigned = Parallel(n_jobs=threads, backend="loky")(
         delayed(_codon_align_one_gene)(
             protein_sequence_files[index],
             dna_sequence_files[index],
