@@ -360,7 +360,7 @@ class GraphScorer:
     """
 
     def __init__(self, truth_map, component_map, compute_attainable=True):
-        from sklearn.metrics import rand_score, normalized_mutual_info_score
+        from sklearn.metrics import rand_score, normalized_mutual_info_score  # noqa: F401
 
         self.universe = sorted((set(truth_map) & set(component_map)) - {"error"})
         if not self.universe:
@@ -408,6 +408,10 @@ class GraphScorer:
             truth = self.truth[keep]
             component = self.component[keep]
             merged, _ = encode([merged_map[self.universe[i]] for i in keep])
+            # imported here as well as in __init__: this branch runs only when the merge
+            # is missing genes, so the omission went unnoticed until a multi-component
+            # merge hit it, and then failed as a NameError rather than a clear message
+            from sklearn.metrics import rand_score, normalized_mutual_info_score
             pc_c = pair_counts(component, truth)
             err_component = pc_c["b"] + pc_c["c"]
             ri_component = rand_score(truth, component)
@@ -476,10 +480,14 @@ class GraphScorer:
 
 
 def graph_similarity_scores(truth_map, merged_map, component_map,
-                            compute_attainable=True):
+                            compute_attainable=True, standard_scores=True):
     """One-shot wrapper around GraphScorer.
 
     Use GraphScorer directly when scoring several merges against the same truth: this
     rebuilds the whole baseline, including C*, on every call.
+
+    standard_scores=False drops AMI, whose expected-mutual-information term dominates the
+    cost on large gene sets; every other metric, the corrected ones included, is unaffected.
     """
-    return GraphScorer(truth_map, component_map, compute_attainable).score(merged_map)
+    return GraphScorer(truth_map, component_map, compute_attainable).score(
+        merged_map, standard_scores=standard_scores)

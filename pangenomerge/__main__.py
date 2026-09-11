@@ -70,6 +70,14 @@ def get_options():
                     help='Tab-separated list of GFFs and their sample IDs for iterative updating of the graph. \
                     Use only for single samples or sets of samples too diverse to create an initial pangenome. \
                     Samples will be merged in the order presented in the file.')
+    IO.add_argument('--fast',
+                    dest='fast',
+                    default=False,
+                    action='store_true',
+                    help='Test mode only: skip AMI. Its expected-mutual-information term \
+                    dominates the cost on large gene sets; ARI, RI, the post-clustering and \
+                    attainability-corrected scores, homogeneity and completeness are all \
+                    still reported.')
     IO.add_argument('--graph-all',
                     dest='graph_all',
                     default=None,
@@ -784,75 +792,6 @@ def main():
             for node in merged_graph:
                 merged_graph.nodes[node]["degrees"] = int(merged_graph.degree[node])
 
-        # calculate clustering performance (if test mode)
-        if options.mode == 'test' and graph_count == (n_graphs-2):
-
-            # info statement...
-            logging.info("Calculating adjusted Rand index (ARI) and adjusted mutual information (AMI)...")
-
-            ### gather seqIDs to enable calculation of clustering metrics
-
-            cluster_dict_merged = get_seqIDs_in_nodes(merged_graph)
-            cluster_dict_all = get_seqIDs_in_nodes(graph_all)
-
-            # diagnostics: how many seqIDs are shared / excluded between merged and all
-            seq_ids_1 = set(cluster_dict_merged)
-            seq_ids_2 = set(cluster_dict_all)
-            common_seq_ids = seq_ids_1 & seq_ids_2
-            only_in_graph_1 = seq_ids_1 - seq_ids_2
-            only_in_graph_2 = seq_ids_2 - seq_ids_1
-            logging.info(f"shared seqIDs: {len(common_seq_ids)}")
-            logging.info(f"seqIDs only in merged (excluded): {len(only_in_graph_1)}")
-            logging.info(f"seqIDs only in all (excluded): {len(only_in_graph_2)}")
-            logging.debug(f"seqIDs only in merged (excluded): {only_in_graph_1}")
-            logging.debug(f"seqIDs only in all (excluded): {only_in_graph_2}")
-
-            # standard scores (per-gene random baseline), post-clustering scores
-            # (component graphs as baseline) and attainability-corrected scores (best
-            # merge reachable from those graphs as ceiling), on the same aligned seqIDs
-            scores = graph_similarity_scores(
-                truth_map=cluster_dict_all,
-                merged_map=cluster_dict_merged,
-                component_map=component_cluster_of_seqid,
-            )
-            logging.info(f"seqIDs scored: {scores['n_seqIDs']}")
-            logging.info(f"Rand Index: {scores['RI']}")
-            logging.info(f"Adjusted Rand Index: {scores['ARI']}")
-            logging.info(f"Mutual Information: {scores['MI']}")
-            logging.info(f"Adjusted Mutual Information: {scores['AMI']}")
-
-            logging.info("Post-clustering scores (component graphs as baseline):")
-            logging.info(f"  RI(merged,all)={scores['RI']:.6f}  RI(component,all)={scores['RI_component']:.6f}")
-            logging.info(f"  pcARI: {scores['pcARI']}")
-            logging.info(f"  NMI(merged,all)={scores['NMI_merged']:.6f}  NMI(component,all)={scores['NMI_component']:.6f}")
-            logging.info(f"  pcNMI: {scores['pcNMI']}")
-
-            if "acARI" in scores:
-                logging.info("Attainability-corrected scores (best reachable merge as ceiling):")
-                logging.info(f"  acARI: {scores['acARI']}")
-                logging.info(f"  acNMI: {scores['acNMI']}")
-                logging.info(f"  pairwise errors: component={scores['err_component']:.0f}  "
-                             f"merged={scores['err_merged']:.0f}  reachable floor={scores['err_cstar']:.0f}")
-
-            logging.info("Over- vs under-merging (all-data graph as reference labels):")
-            logging.info(f"  homogeneity={scores['homogeneity']:.6f}  "
-                         f"(component={scores['homogeneity_component']:.6f})  low => over-merging")
-            logging.info(f"  completeness={scores['completeness']:.6f}  "
-                         f"(component={scores['completeness_component']:.6f})  low => under-merging")
-            logging.info(f"  V-measure={scores['v_measure']:.6f}  "
-                         f"(component={scores['v_measure_component']:.6f})")
-
-            # machine-readable copy of the same numbers, so a results table does not
-            # have to be parsed back out of the log
-            metrics_row = dict(scores)
-            metrics_row["shared_seqIDs"] = len(common_seq_ids)
-            metrics_row["only_in_merged"] = len(only_in_graph_1)
-            metrics_row["only_in_all"] = len(only_in_graph_2)
-            metrics_path = Path(options.outdir) / "test_metrics.tsv"
-            with open(metrics_path, "w") as metrics_handle:
-                metrics_handle.write("\t".join(metrics_row.keys()) + "\n")
-                metrics_handle.write("\t".join(str(v) for v in metrics_row.values()) + "\n")
-            logging.info(f"Wrote test metrics to {metrics_path}")
 
         # info statement...
         logging.info("Merge complete. Preparing attribute metadata for export...")
@@ -1038,6 +977,85 @@ def main():
             nx.write_gml(merged_graph, str(output_path))
         else:
             nx.write_gml(merged_graph, str(output_path))
+
+        # Scoring MUST happen after the graph has been written, not before. Metadata --
+        # seqIDs included -- is stripped from the in-memory graph at the end of every
+        # iteration so add_metadata_to_sqlite stays idempotent, so by the final iteration
+        # the in-memory graph holds only the seqIDs of the component merged last. Scoring
+        # there silently measured a 1/N subset: a 5-component merge scored 376,373 of
+        # 1,880,303 genes. load_metadata_from_sqlite above restores the complete mapping
+        # from SQLite, which is authoritative, so the graph is whole by this point.
+        # calculate clustering performance (if test mode)
+        if options.mode == 'test' and graph_count == (n_graphs-2):
+
+            # info statement...
+            logging.info("Calculating adjusted Rand index (ARI) and adjusted mutual information (AMI)...")
+
+            ### gather seqIDs to enable calculation of clustering metrics
+
+            cluster_dict_merged = get_seqIDs_in_nodes(merged_graph)
+            cluster_dict_all = get_seqIDs_in_nodes(graph_all)
+
+            # diagnostics: how many seqIDs are shared / excluded between merged and all
+            seq_ids_1 = set(cluster_dict_merged)
+            seq_ids_2 = set(cluster_dict_all)
+            common_seq_ids = seq_ids_1 & seq_ids_2
+            only_in_graph_1 = seq_ids_1 - seq_ids_2
+            only_in_graph_2 = seq_ids_2 - seq_ids_1
+            logging.info(f"shared seqIDs: {len(common_seq_ids)}")
+            logging.info(f"seqIDs only in merged (excluded): {len(only_in_graph_1)}")
+            logging.info(f"seqIDs only in all (excluded): {len(only_in_graph_2)}")
+            logging.debug(f"seqIDs only in merged (excluded): {only_in_graph_1}")
+            logging.debug(f"seqIDs only in all (excluded): {only_in_graph_2}")
+
+            # standard scores (per-gene random baseline), post-clustering scores
+            # (component graphs as baseline) and attainability-corrected scores (best
+            # merge reachable from those graphs as ceiling), on the same aligned seqIDs
+            if options.fast:
+                logging.info("--fast: skipping AMI (expected mutual information)")
+            scores = graph_similarity_scores(
+                truth_map=cluster_dict_all,
+                merged_map=cluster_dict_merged,
+                component_map=component_cluster_of_seqid,
+                standard_scores=not options.fast,
+            )
+            logging.info(f"seqIDs scored: {scores['n_seqIDs']}")
+            logging.info(f"Rand Index: {scores['RI']}")
+            logging.info(f"Adjusted Rand Index: {scores['ARI']}")
+            logging.info(f"Mutual Information: {scores['MI']}")
+            if 'AMI' in scores:
+                logging.info(f"Adjusted Mutual Information: {scores['AMI']}")
+
+            logging.info("Post-clustering scores (component graphs as baseline):")
+            logging.info(f"  RI(merged,all)={scores['RI']:.6f}  RI(component,all)={scores['RI_component']:.6f}")
+            logging.info(f"  pcARI: {scores['pcARI']}")
+            logging.info(f"  NMI(merged,all)={scores['NMI_merged']:.6f}  NMI(component,all)={scores['NMI_component']:.6f}")
+            logging.info(f"  pcNMI: {scores['pcNMI']}")
+
+            if "acARI" in scores:
+                logging.info("Attainability-corrected scores (best reachable merge as ceiling):")
+                logging.info(f"  acARI: {scores['acARI']}")
+                logging.info(f"  acNMI: {scores['acNMI']}")
+                logging.info(f"  pairwise errors: component={scores['err_component']:.0f}  "
+                             f"merged={scores['err_merged']:.0f}  reachable floor={scores['err_cstar']:.0f}")
+
+            logging.info("Over- vs under-merging (all-data graph as reference labels):")
+            logging.info(f"  homogeneity={scores['homogeneity']:.6f}  "
+                         f"(component={scores['homogeneity_component']:.6f})  low => over-merging")
+            logging.info(f"  completeness={scores['completeness']:.6f}  "
+                         f"(component={scores['completeness_component']:.6f})  low => under-merging")
+
+            # machine-readable copy of the same numbers, so a results table does not
+            # have to be parsed back out of the log
+            metrics_row = dict(scores)
+            metrics_row["shared_seqIDs"] = len(common_seq_ids)
+            metrics_row["only_in_merged"] = len(only_in_graph_1)
+            metrics_row["only_in_all"] = len(only_in_graph_2)
+            metrics_path = Path(options.outdir) / "test_metrics.tsv"
+            with open(metrics_path, "w") as metrics_handle:
+                metrics_handle.write("\t".join(metrics_row.keys()) + "\n")
+                metrics_handle.write("\t".join(str(v) for v in metrics_row.values()) + "\n")
+            logging.info(f"Wrote test metrics to {metrics_path}")
 
         # reduce memory by removing intermediate files
         for name in [
