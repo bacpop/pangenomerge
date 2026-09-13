@@ -16,6 +16,16 @@ RESULTS = Path(config["results_directory"], "results")
 # resources_batch). Falls back to resources_batch for configs that predate it.
 GGCALLER_RESOURCES = config.get("resources_ggcaller", config["resources_batch"])
 
+# msa_extract: the per-gene sequence extraction that precedes the alignment is
+# split into MSA_SHARDS independent jobs, each a small process pool. Measured on
+# S. pyogenes: serial 42 min -> 32 shards x 6 procs finished in under a minute.
+# Threads do NOT work here (GIL-bound, 2-4x slower than serial); only processes.
+MSA_SHARDS = int(config.get("msa_shards", 32))
+MSA_EXTRACT_RESOURCES = config.get("resources_msa_extract", {
+    "threads": 6, "mem": "24G", "runtime": 240, "nodes": 1,
+    "slurm_partition": config["resources_pangenomerge"]["slurm_partition"],
+})
+
 
 # LOGGING
 
@@ -506,9 +516,55 @@ rule postprocess_pangenome:
 # unaligned_dna_sequences/, so both runs share one --shared-alignment-dir and the
 # (expensive) protein alignment happens once. They diverge only for genes with
 # QC-failing DNA, which is why aligned_gene_sequences/ stays per-mode.
+# One shard of the msa sequence extraction. Writes per-gene protein and DNA
+# inputs into the shared alignment directory (distinct files per gene, so the
+# shards never collide); rule msa then finds them and skips its own serial
+# extraction. Output is a sentinel, not the files: a failed shard must not make
+# snakemake delete what the other shards wrote.
+rule msa_extract:
+    input:
+        seqdb=RESULTS / "pangenomerge" / "pangenome_sequences.sqlite",
+    output:
+        done=RESULTS / "msa" / "extract" / "shard_{shard}.done",
+    params:
+        msadir=RESULTS / "msa",
+        pangenomerge_dir=RESULTS / "pangenomerge",
+        msa_runner=config["pangenomerge_msa_runner"],
+        shards=MSA_SHARDS,
+    conda:
+        "envs/pangenomerge.yaml"
+    threads: MSA_EXTRACT_RESOURCES["threads"]
+    resources:
+        mem=MSA_EXTRACT_RESOURCES["mem"],
+        runtime=MSA_EXTRACT_RESOURCES["runtime"],
+        nodes=MSA_EXTRACT_RESOURCES["nodes"],
+        slurm_partition=MSA_EXTRACT_RESOURCES["slurm_partition"],
+    log:
+        str(LOGDIR / "msa_extract" / "shard_{shard}.log"),
+    shell:
+        r"""
+
+        mkdir -p "$(dirname "{log}")"
+        exec > >(tee -a "{log}") 2>&1
+
+        echo "[msa_extract] start: $(date -Is) shard={wildcards.shard}/{params.shards} procs={threads}"
+        mkdir -p {params.msadir}/alignment {params.msadir}/codon "$(dirname {output.done})"
+
+        # same --outdir/--alignment-outdir/--shared-alignment-dir as rule msa's
+        # codon pass, so the files land exactly where that pass looks for them
+        python3 {params.msa_runner}             --outdir {params.pangenomerge_dir}             --alignment-outdir {params.msadir}/codon             --shared-alignment-dir {params.msadir}/alignment             --alignment pan --codons             --extract-only --shard {wildcards.shard}/{params.shards}             --extract-procs {threads} --immutable-db             --verbose
+
+        echo "ok" > {output.done}
+        echo "[msa_extract] done: $(date -Is)"
+        """
+
+
 rule msa:
     input:
         seqdb=RESULTS / "pangenomerge" / "pangenome_sequences.sqlite",
+        # pre-extracted inputs from the sharded jobs (see rule msa_extract)
+        extracted=expand(str(RESULTS / "msa" / "extract" / "shard_{shard}.done"),
+                         shard=range(MSA_SHARDS)),
     output:
         done=RESULTS / "msa" / "done.txt",
     params:

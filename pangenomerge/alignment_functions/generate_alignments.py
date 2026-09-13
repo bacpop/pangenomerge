@@ -1,4 +1,5 @@
 import os
+import shutil
 import json
 import random
 import subprocess
@@ -171,8 +172,19 @@ def _parse_member_key_from_geneid(geneid, member=None, graph_id=None):
 
 
 def _connect_alignment_sqlite(sqlite_path, sequences_sqlite_path):
-    con = sqlite3.connect(str(sqlite_path))
-    con.execute("ATTACH DATABASE ? AS seq", (str(sequences_sqlite_path),))
+    # PANGENOMERGE_SQLITE_IMMUTABLE=1 opens both databases with SQLite's
+    # immutable=1: no locks are taken and -wal/-shm are never touched, which is
+    # what lets many extraction processes read the databases at once without
+    # contending on GPFS (the msa never writes them). The runner sets it only
+    # for --immutable-db after verifying the WAL is empty, and it is an
+    # environment variable so loky worker processes inherit it.
+    if os.environ.get("PANGENOMERGE_SQLITE_IMMUTABLE") == "1":
+        con = sqlite3.connect(f"file:{sqlite_path}?immutable=1", uri=True)
+        con.execute("ATTACH DATABASE ? AS seq",
+                    (f"file:{sequences_sqlite_path}?immutable=1",))
+    else:
+        con = sqlite3.connect(str(sqlite_path))
+        con.execute("ATTACH DATABASE ? AS seq", (str(sequences_sqlite_path),))
     con.execute("PRAGMA query_only=ON;")
     return con
 
@@ -456,6 +468,41 @@ def get_expected_protein_alignment_path(node, shared_dir):
 def get_expected_unaligned_dna_path(node, shared_dir):
     return os.path.join(shared_dir, "unaligned_dna_sequences",
                         get_alignment_basename(node) + ".fasta")
+
+
+def get_expected_extracted_protein_path(node, shared_dir):
+    """Persistent home of a protein input written by extract_sequences_sharded."""
+    return os.path.join(shared_dir, "unaligned_protein_sequences",
+                        get_alignment_basename(node) + ".fasta")
+
+
+def _output_dna_and_protein_or_reuse(node, temp_dir, output_dir, sqlite_path,
+                                     sequences_sqlite_path, shared_dir):
+    """output_dna_and_protein, unless a sharded extraction already ran.
+
+    extract_sequences_sharded leaves each gene's protein input under the
+    shared directory and its DNA where output_dna_and_protein would put it.
+    When both exist the protein file is hard-linked into the temp dir -
+    align_sequences deletes its input after aligning, and a link keeps the
+    shared copy - and SQLite is not touched at all. Anything missing falls
+    through to the normal extraction, so an absent or partial sharded run is
+    always safe, just slower.
+    """
+    pre = get_expected_extracted_protein_path(node, shared_dir)
+    dna = get_expected_unaligned_dna_path(node, shared_dir)
+    if os.path.isfile(pre) and os.path.isfile(dna):
+        prot = get_expected_protein_input_path(node, temp_dir)
+        os.makedirs(os.path.dirname(prot), exist_ok=True)
+        if not os.path.exists(prot):
+            try:
+                os.link(pre, prot)
+            except OSError:
+                shutil.copyfile(pre, prot)
+        return (prot, dna)
+    return output_dna_and_protein(node, temp_dir, output_dir,
+                                  sqlite_path=sqlite_path,
+                                  sequences_sqlite_path=sequences_sqlite_path,
+                                  shared_dir=shared_dir)
 
 
 def get_shared_manifest_path(shared_dir):
@@ -1237,6 +1284,49 @@ def write_alignment_header(alignment_list, outdir, filename):
     return True
 
 
+def extract_sequences_sharded(G, output_dir, shared_dir, shard_index, shard_count,
+                              procs, sqlite_path, sequences_sqlite_path):
+    """Run only the codon-path sequence extraction, for one shard of the genes.
+
+    Writes each gene's protein input to shared_dir/unaligned_protein_sequences/
+    and its DNA to shared_dir/unaligned_dna_sequences/ (singletons go straight
+    to output_dir/aligned_gene_sequences/, exactly as output_dna_and_protein
+    does), so a subsequent full run reuses them through
+    _output_dna_and_protein_or_reuse and never queries SQLite for them.
+
+    Genes are sorted(G.nodes())[shard_index::shard_count], so shard_count
+    shards partition the pangenome exactly and can run as independent jobs.
+    Within a shard a process pool is used deliberately: the per-gene work is
+    Python-bound, so threads only add GIL contention (measured 2-4x SLOWER
+    than serial even with locking removed), whereas processes measured ~15x
+    faster on one node. Pair with PANGENOMERGE_SQLITE_IMMUTABLE=1 so the
+    processes do not contend on SQLite locks.
+    """
+    output_dir = _normalise_output_dir(output_dir)
+    shared_dir = _resolve_shared_dir(output_dir, shared_dir)
+    protein_dir = os.path.join(shared_dir, "unaligned_protein_sequences", "")
+    for d in (protein_dir,
+              os.path.join(shared_dir, "unaligned_dna_sequences"),
+              os.path.join(output_dir, "aligned_gene_sequences")):
+        os.makedirs(d, exist_ok=True)
+
+    genes = sorted(G.nodes())[shard_index::shard_count]
+    print(f"Extracting sequences: shard {shard_index}/{shard_count}, "
+          f"{len(genes)} genes, {procs} processes", flush=True)
+    results = Parallel(n_jobs=procs, backend="loky")(
+        delayed(output_dna_and_protein)(
+            G.nodes[gene], protein_dir, output_dir,
+            sqlite_path=sqlite_path,
+            sequences_sqlite_path=sequences_sqlite_path,
+            shared_dir=shared_dir,
+        )
+        for gene in tqdm(genes))
+    n_multi = sum(1 for r in results if r[0])
+    print(f"Extracted {len(genes)} genes: {n_multi} multi-sequence, "
+          f"{len(genes) - n_multi} singletons", flush=True)
+    return len(genes)
+
+
 def generate_pan_genome_alignment(G, temp_dir, output_dir, threads, aligner,
                                   codons, strict, resume=False,
                                   sqlite_path=None, sequences_sqlite_path=None,
@@ -1271,13 +1361,9 @@ def generate_pan_genome_alignment(G, temp_dir, output_dir, threads, aligner,
 
         output_files = []
         for gene in protein_pending_gene_ids:
-            output = output_dna_and_protein(
-                G.nodes[gene],
-                temp_dir,
-                output_dir,
-                sqlite_path=sqlite_path,
-                sequences_sqlite_path=sequences_sqlite_path,
-                shared_dir=shared_dir,
+            output = _output_dna_and_protein_or_reuse(
+                G.nodes[gene], temp_dir, output_dir,
+                sqlite_path, sequences_sqlite_path, shared_dir,
             )
             output_files.append(output)
 

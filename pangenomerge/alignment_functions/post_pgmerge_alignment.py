@@ -13,6 +13,7 @@ from .generate_alignments import (
     check_resume_manifest_collision,
     check_shared_manifest,
     concatenate_core_genome_alignments,
+    extract_sequences_sharded,
     generate_core_genome_alignment,
     generate_pan_genome_alignment,
     get_core_gene_nodes,
@@ -157,6 +158,25 @@ def get_options(argv=None):
         ),
     )
     aln_opts.add_argument(
+        "--extract-only", action="store_true", default=False,
+        help="Only extract per-gene protein/DNA inputs for the pan codon "
+             "alignment, for one shard of the genes (see --shard), into the "
+             "shared alignment directory; a later full run reuses them. "
+             "Lets the extraction run as many independent jobs.")
+    aln_opts.add_argument(
+        "--shard", default=None, metavar="I/K",
+        help="With --extract-only: process genes I, I+K, I+2K, ... of the "
+             "sorted node list, 0 <= I < K (default 0/1 = all genes).")
+    aln_opts.add_argument(
+        "--extract-procs", type=int, default=None,
+        help="With --extract-only: worker processes (default: --threads).")
+    aln_opts.add_argument(
+        "--immutable-db", action="store_true", default=False,
+        help="Open the SQLite databases with immutable=1 (no locking). Safe "
+             "because the msa never writes them; required for many concurrent "
+             "readers to scale. Ignored, with a warning, if a WAL file is "
+             "non-empty, since immutable mode cannot see uncheckpointed data.")
+    aln_opts.add_argument(
         "--resume",
         action="store_true",
         default=False,
@@ -172,6 +192,27 @@ def get_options(argv=None):
 
     args = parser.parse_args(argv)
     _resolve_and_validate_paths(parser, args)
+
+    if args.shard is None:
+        args.shard = (0, 1)
+    else:
+        try:
+            shard_index, shard_count = (int(x) for x in args.shard.split("/"))
+        except ValueError:
+            parser.error("--shard must look like I/K, e.g. 3/32")
+        if shard_count < 1 or not 0 <= shard_index < shard_count:
+            parser.error("--shard I/K needs K >= 1 and 0 <= I < K")
+        args.shard = (shard_index, shard_count)
+    if args.extract_only:
+        if args.alignment != "pan" or not (args.codons or args.strict_codons):
+            parser.error("--extract-only applies to --alignment pan with "
+                         "--codons or --strict-codons")
+        if args.extract_procs is None:
+            args.extract_procs = args.threads
+        if args.extract_procs < 1:
+            parser.error("--extract-procs must be at least 1")
+    elif args.shard != (0, 1) or args.extract_procs is not None:
+        parser.error("--shard and --extract-procs require --extract-only")
     return args
 
 
@@ -233,6 +274,25 @@ def _resolve_and_validate_paths(parser, args):
             str(args.shared_alignment_dir), "")
 
 
+def _enable_immutable_sqlite(db_paths):
+    """Turn on immutable SQLite access unless a WAL still holds unflushed data.
+
+    immutable=1 reads the main database file only, so any content still in a
+    -wal file would be invisible. The databases are normally fully checkpointed
+    (the writer closed cleanly and the -wal is empty or absent); if not, fall
+    back to the default locking mode rather than risk missing sequences.
+    """
+    for db_path in db_paths:
+        wal = f"{db_path}-wal"
+        if os.path.exists(wal) and os.path.getsize(wal) > 0:
+            sys.stderr.write(
+                f"pangenomerge-msa: warning: {wal} is non-empty; not using "
+                "immutable SQLite mode\n")
+            return False
+    os.environ["PANGENOMERGE_SQLITE_IMMUTABLE"] = "1"
+    return True
+
+
 def main(argv=None):
     args = get_options(argv)
     try:
@@ -245,11 +305,31 @@ def main(argv=None):
         if args.aligner != "none":
             check_aligner_install(args.aligner)
 
+        if args.immutable_db:
+            _enable_immutable_sqlite([args.sqlite, args.sequences_sqlite])
+
         graph = load_pangenomerge_alignment_graph(args.sqlite, args.gml)
         os.makedirs(args.output_dir, exist_ok=True)
         if args.shared_alignment_dir is not None:
             os.makedirs(args.shared_alignment_dir, exist_ok=True)
             check_shared_manifest(args.shared_alignment_dir, args.aligner)
+
+        if args.extract_only:
+            # No resume manifest and no temp dir: this writes only persistent
+            # per-gene inputs, which the full run picks up on its own.
+            shard_index, shard_count = args.shard
+            extract_sequences_sharded(
+                graph,
+                args.output_dir,
+                args.shared_alignment_dir,
+                shard_index,
+                shard_count,
+                args.extract_procs,
+                args.sqlite,
+                args.sequences_sqlite,
+            )
+            return 0
+
         temp_dir = os.path.join(tempfile.mkdtemp(dir=args.output_dir), "")
 
         try:
